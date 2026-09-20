@@ -71,6 +71,18 @@ class _ExportObjCallable(Protocol):
     def __call__(self, doc: object, output_path: Path, *, decompose: bool = False) -> None: ...
 
 
+# Windows forbids ':' (and a few other characters) in filenames. Qualified
+# replacer keys such as 'badge:123456' or 'gamepass:987' are otherwise stored
+# and displayed verbatim (AssetEntry['id'], Cache Viewer's Asset ID column,
+# "Send to Replacer") so only the on-disk filename needs sanitizing here.
+_WINDOWS_UNSAFE_FILENAME_CHARS = str.maketrans({c: '_' for c in '<>:"/\\|?*'})
+
+
+def _safe_filename_id(asset_id: str) -> str:
+    """Sanitize an asset ID for use as a filename component."""
+    return asset_id.translate(_WINDOWS_UNSAFE_FILENAME_CHARS)
+
+
 def _lazy_attr(module_name: str, attr_name: str) -> object:
     """Load a deliberately lazy module attribute without importing it at startup."""
     module = importlib.import_module(module_name, package=__package__)
@@ -332,14 +344,14 @@ class CacheManager:
         type_name = self.get_asset_type_name(asset_type)
         type_dir = self.cache_dir / type_name
         type_dir.mkdir(exist_ok=True)
-        return type_dir / f'{asset_id}.bin'
+        return type_dir / f'{_safe_filename_id(asset_id)}.bin'
 
     def get_raw_asset_path(self, asset_id: str, asset_type: int) -> Path:
         """Get storage path for the raw (pre-conversion) sidecar file."""
         type_name = self.get_asset_type_name(asset_type)
         type_dir = self.cache_dir / type_name
         type_dir.mkdir(exist_ok=True)
-        return type_dir / f'{asset_id}.raw'
+        return type_dir / f'{_safe_filename_id(asset_id)}.raw'
 
     def get_texturepack_slot_dir(self) -> Path:
         """Return the persistent cache directory for captured TexturePack slots."""
