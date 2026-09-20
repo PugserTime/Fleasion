@@ -78,11 +78,55 @@ ASSET_DELIVERY_HOST = 'assetdelivery.roblox.com'
 GAMEJOIN_HOST = 'gamejoin.roblox.com'
 PROFILE_API_HOST = 'apis.roblox.com'
 PROFILE_API_PATH_FRAGMENT = '/v1/user/profiles/get-profiles'
+THUMBNAILS_HOST = 'thumbnails.roblox.com'
 CLIENT_SETTINGS_HOSTS: frozenset[str] = frozenset(
     {'clientsettingscdn.roblox.com', 'clientsettings.roblox.com'}
 )
 CDN_HOSTS: frozenset[str] = frozenset({'fts.rbxcdn.com', 'contentdelivery.roblox.com'})
-BASE_INTERCEPT_HOSTS: frozenset[str] = frozenset({ASSET_DELIVERY_HOST, GAMEJOIN_HOST, *CDN_HOSTS})
+BASE_INTERCEPT_HOSTS: frozenset[str] = frozenset(
+    {ASSET_DELIVERY_HOST, GAMEJOIN_HOST, THUMBNAILS_HOST, *CDN_HOSTS}
+)
+
+# GET endpoints: domain is determined by path prefix alone.
+_THUMBNAIL_PATH_DOMAINS: tuple[tuple[str, str], ...] = (
+    ('/v1/badges/icons', 'badge'),
+    ('/v1/game-passes', 'gamepass'),
+    ('/v1/developer-products/icons', 'devproduct'),
+    ('/v1/places/gameicons', 'universe'),
+    ('/v1/games/icons', 'universe'),
+    ('/v1/groups/icons', 'group'),
+    ('/v1/bundles/thumbnails', 'bundle'),
+    ('/v1/users/avatar-headshot', 'user'),
+    ('/v1/users/avatar-bust', 'user'),
+    ('/v1/users/avatar', 'user'),
+    ('/v1/asset-thumbnail-animated', 'asset'),
+    ('/v1/assets', 'asset'),
+)
+
+# POST /v1/batch: each item in the request body carries its own "type" instead
+# of it being implied by the URL. Keys are Roblox's ThumbnailType strings.
+_THUMBNAIL_BATCH_TYPE_DOMAINS: dict[str, str] = {
+    'avatar': 'user',
+    'avatarheadshot': 'user',
+    'avatarbust': 'user',
+    'badgeicon': 'badge',
+    'gameicon': 'universe',
+    'gamepassicon': 'gamepass',
+    'developerproducticon': 'devproduct',
+    'groupicon': 'group',
+    'bundlethumbnail': 'bundle',
+    'asset': 'asset',
+    'outfit': 'user',
+}
+
+
+def _thumbnail_domain_for_path(path: str) -> str | None:
+    """Map a GET thumbnails.roblox.com path to a replacement-key domain."""
+    base = path.split('?', 1)[0]
+    for prefix, domain in _THUMBNAIL_PATH_DOMAINS:
+        if base.startswith(prefix):
+            return domain
+    return None
 USERNAME_SPOOFER_INTERCEPT_HOSTS: frozenset[str] = frozenset({PROFILE_API_HOST})
 CUSTOM_FFLAGS_INTERCEPT_HOSTS: frozenset[str] = CLIENT_SETTINGS_HOSTS
 INTERCEPT_HOSTS: frozenset[str] = (
@@ -2993,6 +3037,80 @@ class FleasionProxy:
                 self.cache_scraper.process_cdn_response(full_url, path, resp_body_for_cache, ct)
             return resp_body_raw, response_modified
 
+        def _thumbnail_replacement_key(domain: str, target_id: object) -> str | None:
+            if target_id is None:
+                return None
+            try:
+                numeric_id = int(target_id)
+            except (TypeError, ValueError):
+                return None
+            return f'{domain}:{numeric_id}'
+
+        async def modify_thumbnails_response(
+            path: str,
+            resp_headers: dict[bytes, bytes],
+            resp_body_raw: bytes,
+            is_batch_request: bool,
+            batch_domains: dict[str, str],
+        ) -> tuple[bytes, bool]:
+            replacements, removals, cdn_replacements, local_replacements = (
+                self.texture_stripper.config_manager.get_all_replacements()
+            )
+            if not removals and not cdn_replacements and not local_replacements:
+                return resp_body_raw, False
+
+            resp_body_plain = _decompress_body(resp_body_raw, resp_headers)
+            try:
+                payload = json.loads(resp_body_plain)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return resp_body_raw, False
+
+            data = payload.get('data') if isinstance(payload, dict) else None
+            if not isinstance(data, list):
+                return resp_body_raw, False
+
+            path_domain = None if is_batch_request else _thumbnail_domain_for_path(path)
+            changed = False
+
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                if is_batch_request:
+                    domain = batch_domains.get(str(item.get('requestId')))
+                else:
+                    domain = path_domain
+                if domain is None:
+                    continue
+
+                key = _thumbnail_replacement_key(domain, item.get('targetId'))
+                if key is None:
+                    continue
+
+                if key in removals:
+                    item['imageUrl'] = None
+                    item['state'] = 'Blocked'
+                    changed = True
+                elif key in cdn_replacements:
+                    item['imageUrl'] = cdn_replacements[key]
+                    item['state'] = 'Completed'
+                    changed = True
+                elif key in local_replacements:
+                    item['imageUrl'] = self.texture_stripper.register_local_thumbnail(
+                        local_replacements[key]
+                    )
+                    item['state'] = 'Completed'
+                    changed = True
+
+            if not changed:
+                return resp_body_raw, False
+
+            log_buffer.log(
+                'Thumbnail',
+                f'Rewrote {sum(1 for i in data if isinstance(i, dict) and i.get("state") in ("Completed", "Blocked"))} '
+                f'thumbnail item(s) for {path[:120]}',
+            )
+            return json.dumps(payload).encode('utf-8'), True
+
         async def run_session_loop() -> None:
             nonlocal pending_req
 
@@ -3126,6 +3244,8 @@ class FleasionProxy:
                     hold=self._intercept_all_hosts and self._intercept_matches(host, path),
                 )
                 is_batch = host == ASSET_DELIVERY_HOST and b'/v1/assets/batch' in req_first
+                is_thumbnails_batch = host == THUMBNAILS_HOST and b'/v1/batch' in req_first
+                thumbnails_batch_domains: dict[str, str] = {}
                 batch_id = ''
                 req_body_modified = req_body_raw
                 scraper_body = req_body_raw
@@ -3231,7 +3351,27 @@ class FleasionProxy:
                             _reassemble_raw_request(req_first, req_headers, req_body_raw)
                         )
                 else:
-                    # Forward request as-is.
+                    # Forward request as-is. For the polymorphic /v1/batch
+                    # thumbnails endpoint, first read the plain request body so
+                    # the response phase knows which domain (badge/asset/user/
+                    # etc.) each requestId belongs to - that endpoint mixes
+                    # multiple thumbnail types in a single call, and the type
+                    # only appears in the request, never the response.
+                    if is_thumbnails_batch:
+                        thumb_req_plain = _decompress_body(req_body_raw, req_headers)
+                        try:
+                            thumb_req_items = json.loads(thumb_req_plain)
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            thumb_req_items = None
+                        if isinstance(thumb_req_items, list):
+                            for thumb_item in thumb_req_items:
+                                if not isinstance(thumb_item, dict):
+                                    continue
+                                req_id = thumb_item.get('requestId')
+                                item_type = str(thumb_item.get('type', '')).strip().lower()
+                                domain = _THUMBNAIL_BATCH_TYPE_DOMAINS.get(item_type)
+                                if req_id is not None and domain is not None:
+                                    thumbnails_batch_domains[str(req_id)] = domain
                     if not await ensure_upstream(path):
                         break
                     if (
@@ -3366,6 +3506,15 @@ class FleasionProxy:
                 elif host in CDN_HOSTS:
                     resp_body_raw, response_modified = await modify_cdn_response(
                         path, resp_headers, resp_body_raw, short_circuit
+                    )
+
+                elif host == THUMBNAILS_HOST:
+                    resp_body_raw, response_modified = await modify_thumbnails_response(
+                        path,
+                        resp_headers,
+                        resp_body_raw,
+                        is_thumbnails_batch,
+                        thumbnails_batch_domains,
                     )
 
                 elif custom_fflag_response_enabled and 200 <= status_code < 300 and resp_body_raw:
