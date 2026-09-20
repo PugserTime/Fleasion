@@ -15,6 +15,7 @@ import json
 import logging
 import struct
 import time
+import uuid
 import zlib
 from pathlib import Path
 from threading import Lock, Thread
@@ -2408,6 +2409,20 @@ class TextureStripper:
                     orm_overrides=orm_overrides,
                     normal_overrides=normal_overrides,
                 )
+
+    def register_local_thumbnail(self, local_path: str) -> str:
+        """Register a local file to be served as a thumbnails.roblox.com imageUrl.
+
+        Returns a synthetic URL on an already-intercepted CDN host
+        (fts.rbxcdn.com). When Roblox's client fetches that URL to render the
+        thumbnail, check_cdn_request() below matches it via _local_redirects
+        exactly the same way it does for a normal asset-batch local swap.
+        """
+        token = uuid.uuid4().hex
+        synthetic_url = f'https://fts.rbxcdn.com/fleasion-thumb/{token}'
+        with self._lock:
+            self._local_redirects[synthetic_url] = local_path
+        return synthetic_url
 
     # CDN request check (called from server MITM thread for Roblox CDN hosts)
 
