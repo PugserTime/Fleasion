@@ -545,6 +545,12 @@ class CacheScraper:
         self.cache_logs: dict[AssetId, CacheLogEntry] = {}
         # base CDN URL (no query) -> list[asset_id]  (1:many - same replacement ID -> same CDN URL)
         self._url_to_asset: dict[str, list[AssetId]] = {}
+        # asset_id -> thumbnails.roblox.com domain ('badge', 'gamepass', 'user', ...)
+        # for entries registered via register_thumbnail_icon(). Consulted by
+        # process_cdn_response() to tag stored metadata so the Cache Viewer can
+        # group/label them and so their id (already 'domain:targetId', matching
+        # the replacer's qualified-key format) is easy to spot.
+        self._thumbnail_domains: dict[AssetId, str] = {}
         # TexturePack sub-asset lookup: sub_asset_id -> (parent_pack_id, map_index)
         # map_index 0=Color/Albedo, 1=Normal, 2=ORM (Roughness+Metalness combined)
         # Populated when a TexturePack XML is successfully fetched and cached.
@@ -617,6 +623,7 @@ class CacheScraper:
             self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix='cache_api')
             self.cache_logs.clear()
             self._url_to_asset.clear()
+            self._thumbnail_domains.clear()
             self._texpack_subasset_lookup.clear()
             self._url_to_texpack_slot.clear()
             self._texpack_vslot_channel.clear()
@@ -748,6 +755,39 @@ class CacheScraper:
         if tracked > 0:
             log_buffer.log('Cache', f'Tracking {format_count(tracked, "asset")} for caching')
 
+    # Called from server MITM thread for thumbnails.roblox.com responses
+    # (both plain GET endpoints and POST /v1/batch), independent of whether
+    # any replacement rule exists for the item — this is what makes badge,
+    # game-pass, dev-product, group, bundle, universe/game, user and asset
+    # icons show up in the Cache Viewer at all.
+
+    def register_thumbnail_icon(self, domain: str, target_id: int, image_url: str) -> None:
+        """Track a thumbnails.roblox.com icon so its CDN download gets cached.
+
+        Stores it under the id ``f'{domain}:{target_id}'`` — the exact
+        qualified key format the replacer/config layer already accepts
+        (e.g. ``badge:3582960623147462``) — so "Send to Replacer" in the
+        Cache Viewer works with zero extra glue.
+        """
+        if not self.enabled or not image_url:
+            return
+        asset_id = f'{domain}:{target_id}'
+        base_url = image_url.split('?', 1)[0]
+        with self._lock:
+            # Roblox reuses the same rendered image (and therefore the same
+            # CDN URL) across requests for a given targetId; don't re-track
+            # a URL we've already registered.
+            if base_url in self._url_to_asset:
+                return
+            if asset_id not in self.cache_logs:
+                self.cache_logs[asset_id] = {
+                    'location': image_url,
+                    # Thumbnails are always plain rendered images.
+                    'assetTypeId': 1,
+                }
+            self._url_to_asset.setdefault(base_url, []).append(asset_id)
+            self._thumbnail_domains[asset_id] = domain
+
     # Called from server MITM thread for Roblox CDN responses
 
     def process_cdn_response(
@@ -840,9 +880,19 @@ class CacheScraper:
 
         # Store / convert for every original asset ID that shares this CDN URL
         for asset_id, asset_type in pending:
-            needs_conversion = (
-                asset_type in {1, 13} and inner[:8] in {b'\xabKTX 20\xbb', b'\xabKTX 11\xbb'}
-            ) or asset_type == 63
+            with self._lock:
+                thumbnail_domain = self._thumbnail_domains.get(asset_id)
+            asset_metadata = (
+                {**metadata, 'thumbnail_domain': thumbnail_domain}
+                if thumbnail_domain
+                else metadata
+            )
+            # thumbnails.roblox.com icons are always plain rendered images,
+            # never a KTX texture or SolidModel — skip the conversion path.
+            needs_conversion = thumbnail_domain is None and (
+                (asset_type in {1, 13} and inner[:8] in {b'\xabKTX 20\xbb', b'\xabKTX 11\xbb'})
+                or asset_type == 63
+            )
 
             if needs_conversion:
                 self._submit_background(
@@ -865,7 +915,7 @@ class CacheScraper:
                         asset_type=asset_type,
                         data=inner,
                         url=full_url,
-                        metadata=metadata,
+                        metadata=asset_metadata,
                     ),
                     generation=generation,
                 )
