@@ -3053,10 +3053,12 @@ class FleasionProxy:
             is_batch_request: bool,
             batch_domains: dict[str, str],
         ) -> tuple[bytes, bool]:
+            cache_scraper_enabled = self.cache_scraper.enabled
             replacements, removals, cdn_replacements, local_replacements = (
                 self.texture_stripper.config_manager.get_all_replacements()
             )
-            if not removals and not cdn_replacements and not local_replacements:
+            has_replacement_rules = bool(removals or cdn_replacements or local_replacements)
+            if not has_replacement_rules and not cache_scraper_enabled:
                 return resp_body_raw, False
 
             resp_body_plain = _decompress_body(resp_body_raw, resp_headers)
@@ -3082,7 +3084,27 @@ class FleasionProxy:
                 if domain is None:
                     continue
 
-                key = _thumbnail_replacement_key(domain, item.get('targetId'))
+                target_id = item.get('targetId')
+                if cache_scraper_enabled:
+                    image_url = item.get('imageUrl')
+                    state = item.get('state')
+                    # Only track completed, already-rendered icons — a
+                    # Pending/Error state has no CDN image to capture yet.
+                    if (
+                        isinstance(image_url, str)
+                        and image_url
+                        and state == 'Completed'
+                        and isinstance(target_id, (int, str))
+                    ):
+                        with contextlib.suppress(TypeError, ValueError):
+                            self.cache_scraper.register_thumbnail_icon(
+                                domain, int(target_id), image_url
+                            )
+
+                if not has_replacement_rules:
+                    continue
+
+                key = _thumbnail_replacement_key(domain, target_id)
                 if key is None:
                     continue
 
