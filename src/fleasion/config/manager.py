@@ -279,11 +279,22 @@ def _parse_config_asset_id(value: object) -> int | None:
     return None
 
 
+
+# thumbnails.roblox.com replacement keys: "<domain>:<id>", e.g. "badge:2124449010".
+# Namespaced by domain so a badge ID can never collide with an asset ID (or
+# with a TexturePack slot key) that happens to share the same number.
+_THUMBNAIL_KEY_DOMAINS = frozenset(
+    {'badge', 'asset', 'gamepass', 'devproduct', 'universe', 'group', 'user', 'bundle'}
+)
+
+
 def _parse_qualified_replacement_key(value: str) -> str | None:
     prefix, suffix = value.split(':', 1)
     if prefix.isdigit() and suffix.isdigit():
         return value if int(prefix) > _RESERVED_ASSET_TYPE_ID_MAX else None
     if prefix == 'TexturePack' and suffix.isdigit():
+        return value
+    if prefix in _THUMBNAIL_KEY_DOMAINS and suffix.isdigit():
         return value
     return None
 
